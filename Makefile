@@ -1,0 +1,137 @@
+# Define a directory for dependencies in the user's home folder
+DEPS_DIR := $(HOME)/Scribe-Dependencies
+WHISPER_CPP_DIR := $(DEPS_DIR)/whisper.cpp
+FRAMEWORK_PATH := $(WHISPER_CPP_DIR)/build-apple/whisper.xcframework
+LOCAL_DERIVED_DATA := $(CURDIR)/.local-build
+LOCAL_CODESIGN_IDENTITY ?=
+
+.PHONY: all clean whisper setup build local check healthcheck help dev run
+
+# Default target
+all: check build
+
+# Development workflow
+dev: build run
+
+# Prerequisites
+check:
+	@echo "Checking prerequisites..."
+	@command -v git >/dev/null 2>&1 || { echo "git is not installed"; exit 1; }
+	@command -v xcodebuild >/dev/null 2>&1 || { echo "xcodebuild is not installed (need Xcode)"; exit 1; }
+	@command -v swift >/dev/null 2>&1 || { echo "swift is not installed"; exit 1; }
+	@echo "Prerequisites OK"
+
+healthcheck: check
+
+# Build process
+whisper:
+	@mkdir -p $(DEPS_DIR)
+	@if [ ! -d "$(FRAMEWORK_PATH)" ]; then \
+		echo "Building whisper.xcframework in $(DEPS_DIR)..."; \
+		if [ ! -d "$(WHISPER_CPP_DIR)" ]; then \
+			git clone https://github.com/ggerganov/whisper.cpp.git $(WHISPER_CPP_DIR); \
+		else \
+			(cd $(WHISPER_CPP_DIR) && git pull); \
+		fi; \
+		cd $(WHISPER_CPP_DIR) && ./build-xcframework.sh; \
+	else \
+		echo "whisper.xcframework already built in $(DEPS_DIR), skipping build"; \
+	fi
+
+setup: whisper
+	@echo "Whisper framework is ready at $(FRAMEWORK_PATH)"
+	@echo "Please ensure your Xcode project references the framework from this new location."
+
+build: setup
+	xcodebuild -project Scribe.xcodeproj -scheme Scribe -configuration Debug \
+		-skipPackagePluginValidation -skipMacroValidation CODE_SIGN_IDENTITY="" build
+
+# Build locally with stable Apple Development signing when available.
+local: check setup
+	@echo "Building Scribe for local use (no Apple Developer certificate required)..."
+	@rm -rf "$(LOCAL_DERIVED_DATA)"
+	@SIGNING_IDENTITY="$(LOCAL_CODESIGN_IDENTITY)"; \
+	if [ -z "$$SIGNING_IDENTITY" ]; then \
+		SIGNING_IDENTITIES=$$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Apple Development: / { print $$2 }'); \
+		SIGNING_IDENTITY_COUNT=$$(printf '%s\n' "$$SIGNING_IDENTITIES" | awk 'NF { count++ } END { print count + 0 }'); \
+		if [ "$$SIGNING_IDENTITY_COUNT" -eq 1 ]; then \
+			SIGNING_IDENTITY=$$(printf '%s\n' "$$SIGNING_IDENTITIES" | awk 'NF { print; exit }'); \
+		elif [ "$$SIGNING_IDENTITY_COUNT" -gt 1 ]; then \
+			echo "Multiple Apple Development identities found; set LOCAL_CODESIGN_IDENTITY to choose one; using ad-hoc signing"; \
+		fi; \
+	fi; \
+	if [ -n "$$SIGNING_IDENTITY" ] && [ "$$SIGNING_IDENTITY" != "-" ]; then \
+		SIGNING_REQUIRED=YES; \
+		echo "Using stable local signing identity: $$SIGNING_IDENTITY"; \
+	else \
+		SIGNING_IDENTITY="-"; \
+		SIGNING_REQUIRED=NO; \
+		echo "Using ad-hoc signing (permissions may need approval after rebuilds)"; \
+	fi; \
+	xcodebuild -project Scribe.xcodeproj -scheme Scribe -configuration Debug \
+		-derivedDataPath "$(LOCAL_DERIVED_DATA)" \
+		-xcconfig LocalBuild.xcconfig \
+		-skipPackagePluginValidation \
+		-skipMacroValidation \
+		CODE_SIGN_IDENTITY="$$SIGNING_IDENTITY" \
+		CODE_SIGNING_REQUIRED="$$SIGNING_REQUIRED" \
+		CODE_SIGNING_ALLOWED=YES \
+		DEVELOPMENT_TEAM="" \
+		CODE_SIGN_ENTITLEMENTS="$(CURDIR)/Scribe/Scribe.local.entitlements" \
+		SWIFT_ACTIVE_COMPILATION_CONDITIONS='$$(inherited) LOCAL_BUILD' \
+		build
+	@APP_PATH="$(LOCAL_DERIVED_DATA)/Build/Products/Debug/Scribe.app" && \
+	if [ -d "$$APP_PATH" ]; then \
+		echo "Copying Scribe.app to ~/Downloads..."; \
+		rm -rf "$$HOME/Downloads/Scribe.app"; \
+		ditto "$$APP_PATH" "$$HOME/Downloads/Scribe.app"; \
+		xattr -cr "$$HOME/Downloads/Scribe.app"; \
+		echo ""; \
+		echo "Build complete! App saved to: ~/Downloads/Scribe.app"; \
+		echo "Run with: open ~/Downloads/Scribe.app"; \
+		echo ""; \
+		echo "Limitations of local builds:"; \
+		echo "  - No iCloud dictionary sync"; \
+		echo "  - No automatic updates (pull new code and rebuild to update)"; \
+	else \
+		echo "Error: Could not find built Scribe.app at $$APP_PATH"; \
+		exit 1; \
+	fi
+
+# Run application
+run:
+	@if [ -d "$$HOME/Downloads/Scribe.app" ]; then \
+		echo "Opening ~/Downloads/Scribe.app..."; \
+		open "$$HOME/Downloads/Scribe.app"; \
+	else \
+		echo "Looking for Scribe.app in DerivedData..."; \
+		APP_PATH=$$(find "$$HOME/Library/Developer/Xcode/DerivedData" -name "Scribe.app" -type d | head -1) && \
+		if [ -n "$$APP_PATH" ]; then \
+			echo "Found app at: $$APP_PATH"; \
+			open "$$APP_PATH"; \
+		else \
+			echo "Scribe.app not found. Please run 'make build' or 'make local' first."; \
+			exit 1; \
+		fi; \
+	fi
+
+# Cleanup
+clean:
+	@echo "Cleaning build artifacts..."
+	@rm -rf $(DEPS_DIR)
+	@echo "Clean complete"
+
+# Help
+help:
+	@echo "Available targets:"
+	@echo "  check/healthcheck  Check if required CLI tools are installed"
+	@echo "  whisper            Clone and build whisper.cpp XCFramework"
+	@echo "  setup              Copy whisper XCFramework to Scribe project"
+	@echo "  build              Build the Scribe Xcode project"
+	@echo "  local              Build locally with stable signing when available"
+	@echo "    LOCAL_CODESIGN_IDENTITY=<SHA or name> overrides automatic Apple Development detection"
+	@echo "  run                Launch the built Scribe app"
+	@echo "  dev                Build and run the app (for development)"
+	@echo "  all                Run full build process (default)"
+	@echo "  clean              Remove build artifacts"
+	@echo "  help               Show this help message"
